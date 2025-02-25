@@ -92,15 +92,29 @@ async def process_file(request: Request,file: UploadFile = File(...)):
         logger.info(f"File received: {file.filename}")
 
         # Ensure file is an Excel file
-        if not file.filename.endswith(".xlsx"):
+        if not (file.filename.endswith(".xlsx") or file.filename.endswith(".csv")):
             logger.error("Invalid file type")
-            return JSONResponse({"status": 400, "error": "Invalid file type"})
+            return JSONResponse({"status": 400, "error": "Invalid file type. Only .xlsx and .csv allowed"})
 
         try:
             # Read file into memory using BytesIO (fix for cPanel issue)
             file_contents = await file.read()
             file_stream = io.BytesIO(file_contents)
-            df = pd.read_excel(file_stream, engine="openpyxl", dtype=str)
+
+            if file.filename.endswith(".xlsx"):
+                # df = pd.read_excel(file_stream, engine="openpyxl", dtype=str)
+                df = pd.read_csv(
+                        file_stream,
+                        dtype=str,
+                        encoding="utf-8",
+                        delimiter=None,
+                        on_bad_lines="skip",
+                        skip_blank_lines=True,
+                        quotechar='"',
+                        low_memory=False
+                    )
+            else:
+                df = pd.read_csv(file_stream, dtype=str)
         except Exception as e:
             e_traceback = traceback.format_exc()
             logger.error(f"File read error: {e_traceback}")

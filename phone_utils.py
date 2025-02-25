@@ -1,5 +1,6 @@
 import re
-from bson import Binary, ObjectId
+from bson import ObjectId, Binary, Decimal128
+from datetime import datetime
 
 # Dictionary of country dialing codes
 COUNTRY_DIALING_CODES = {
@@ -32,10 +33,19 @@ def normalize_phone_number(phone: str):
     return phone, phone
 
 def clean_mongo_data(doc):
-    """Convert non-serializable MongoDB fields to JSON-compatible format."""
-    for key, value in doc.items():
-        if isinstance(value, Binary):
-            doc[key] = value.decode("utf-8", errors="ignore")  # Convert Binary to string
-        elif isinstance(value, ObjectId):
-            doc[key] = str(value)  # Convert ObjectId to string
+    """Recursively convert MongoDB fields to JSON-safe formats."""
+    if isinstance(doc, dict):
+        return {key: clean_mongo_data(value) for key, value in doc.items()}
+    elif isinstance(doc, list):
+        return [clean_mongo_data(item) for item in doc]
+    elif isinstance(doc, ObjectId):
+        return str(doc)  # Convert ObjectId to string
+    elif isinstance(doc, datetime):
+        return doc.isoformat()  # Convert datetime to ISO format
+    elif isinstance(doc, Binary):
+        return doc.decode("utf-8", errors="ignore")  # Convert Binary to string
+    elif isinstance(doc, Decimal128):
+        return float(doc.to_decimal())  # Convert Decimal128 to float
+    elif isinstance(doc, int):  # Handle large MongoDB Int64 values safely
+        return int(doc)
     return doc

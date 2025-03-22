@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request, Depends, Security
 from fastapi.security import APIKeyHeader
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.exceptions import RequestValidationError
@@ -27,6 +27,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+api_key_header = APIKeyHeader(name="x-api-key", auto_error=True)
+
+def verify_api_key(request: Request, api_key: str = Security(api_key_header)):
+    rapidapi_key = request.headers.get("x-rapidapi-key")
+    
+    # ✅ Allow request if RapidAPI key is present
+    if rapidapi_key:
+        logger.info(f"RapidAPI request detected, skipping API key check.")
+        return  # Allow access immediately
+
+    # Normal API key verification
+    if api_key != API_KEY:
+        logger.warning("Invalid API key provided")
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
 app = FastAPI()
 
 # Allow only your frontend domain (replace with your actual domain)
@@ -37,42 +52,31 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )
-
-# Convert ALLOWED_IPS from .env to a proper list (removes empty values)
+# Convert ALLOWED_IPS string from .env to a list
 allowed_ips = os.getenv("ALLOWED_IPS", "")
-allowed_ips = [ip.strip() for ip in allowed_ips.split(",") if ip.strip()]
+allowed_ips = [ip.strip() for ip in allowed_ips.split(",") if ip]
 
 @app.middleware("http")
-async def security_middleware(request: Request, call_next):
+async def restrict_ip_access(request: Request, call_next):
     rapidapi_key = request.headers.get("x-rapidapi-key")
-    api_key = request.headers.get("x-api-key")
-    client_ip = request.headers.get("X-Forwarded-For", request.client.host)
-    request_path = request.url.path
 
+    # ✅ Bypass IP check completely if RapidAPI key is provided
+    if rapidapi_key:
+        logger.info("RapidAPI request detected, bypassing all IP restrictions.")
+        return await call_next(request)  # Allow request immediately
+
+    # Normal IP-based restriction
+    client_ip = request.headers.get("X-Forwarded-For", request.client.host)
     if client_ip:
         client_ip = client_ip.split(",")[0].strip()
-    print(client_ip)
-    # Debug log
-    logger.info(f"SECURITY CHECK: IP={client_ip}, Path={request_path}, x-rapidapi-key={rapidapi_key}, x-api-key={api_key}")
 
-    #**Allow RapidAPI key ONLY for `/api/search/`**
-    if rapidapi_key:
-        if request_path.startswith("/api/search/"):
-            logger.info(f"RapidAPI request allowed for `/api/search/`. Key={rapidapi_key}")
-            return await call_next(request)
-        else:
-            logger.warning("RapidAPI key used on unauthorized path.")
-            return JSONResponse({"error": "Unauthorized path for RapidAPI."}, status_code=403)
-        
-    if not api_key or api_key != API_KEY:
-        logger.warning("Invalid or missing API key.")
-        return JSONResponse({"error": "Invalid API key."}, status_code=403)
+    logger.info(f"Middleware check - Client IP: {client_ip}")
 
     if client_ip not in allowed_ips:
-        logger.warning(f"Unauthorized request from IP: {client_ip}")
-        return JSONResponse({"error": "Unauthorized IP."}, status_code=403)
-    return await call_next(request)
+        logger.warning(f"Unauthorized IP access attempt: {client_ip}")
+        return JSONResponse({"error": "Unauthorized IP"}, status_code=403)
 
+    return await call_next(request)
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -94,14 +98,14 @@ collection = db[os.getenv("MONGO_COLLECTION")]
 PROCESSED_DIR = os.getenv("PROCESSED_DIR")
 os.makedirs(PROCESSED_DIR, exist_ok=True)
 
-@app.get("/api/")
+@app.get("/api/",dependencies=[Depends(verify_api_key)])
 def home():
     logger.info("API is working!")
     return JSONResponse(
         status_code=200, content={"message": "API is working!"},
     )
 
-@app.post("/api/process-file/")
+@app.post("/api/process-file/",dependencies=[Depends(verify_api_key)])
 @limiter.limit("5/minute")
 async def process_file(request: Request,file: UploadFile = File(...)):
     try:
@@ -131,7 +135,7 @@ async def process_file(request: Request,file: UploadFile = File(...)):
                     )
                     # Ensure DataFrame is not empty
                     if df.empty:
-                        return JSONResponse({"status": 400, "error": "Uploaded Excel file is empty"})
+                        raise ValueError("Uploaded Excel file is empty")
                 except Exception as e:
                     logger.error(f"Excel file read error: {str(e)}")
                     return JSONResponse({"status": 500, "error": f"Excel file read error: {str(e)}"})
@@ -157,7 +161,7 @@ async def process_file(request: Request,file: UploadFile = File(...)):
                     )
                     # Ensure DataFrame is not empty
                     if df.empty:
-                        return JSONResponse({"status": 400, "error": "Uploaded CSV file is empty"})
+                        raise ValueError("Uploaded CSV file is empty")
                 except Exception as e:
                     logger.error(f"CSV file read error: {str(e)}")
                     return JSONResponse({"status": 500, "error": f"CSV file read error: {str(e)}"})
@@ -218,9 +222,9 @@ async def process_file(request: Request,file: UploadFile = File(...)):
         logger.info(f"Extracted {len(values_to_search)} values from column: {match_column}")
 
         try:
-            # Fetch matching records from MongoDB
-            matches = await collection.find(query, {"_id": 0}).to_list(None)
-            matches_df = pd.DataFrame(matches)
+                # Fetch matching records from MongoDB
+                matches = await collection.find(query, {"_id": 0}).to_list(None)
+                matches_df = pd.DataFrame(matches)
         except Exception as e:
             error_message = traceback.format_exc()
             logger.error(f"MongoDB query error: {error_message}")
@@ -240,11 +244,11 @@ async def process_file(request: Request,file: UploadFile = File(...)):
         output_file_path = os.path.join(PROCESSED_DIR, unique_filename)
 
         try:
-            with pd.ExcelWriter(output_file_path, engine="openpyxl") as writer:
-                if not matches_df.empty:
-                    matches_df.to_excel(writer, sheet_name="Match Found", index=False)
-                if not no_matches_df.empty:
-                    no_matches_df.to_excel(writer, sheet_name="No Matches Found", index=False)
+                with pd.ExcelWriter(output_file_path, engine="openpyxl") as writer:
+                    if not matches_df.empty:
+                        matches_df.to_excel(writer, sheet_name="Match Found", index=False)
+                    if not no_matches_df.empty:
+                        no_matches_df.to_excel(writer, sheet_name="No Matches Found", index=False)
         except Exception as e:
             error_message = traceback.format_exc()
             logger.error(f"File writing error: {error_message}")
@@ -260,7 +264,7 @@ async def process_file(request: Request,file: UploadFile = File(...)):
         logger.error(f"Unexpected error: {str(e)}")
         return JSONResponse({"status": 500, "error": "Internal Server Error"})
 
-@app.get("/api/download-file/{filename}")
+@app.get("/api/download-file/{filename}",dependencies=[Depends(verify_api_key)])
 @limiter.limit("10/minute")
 async def download_file(request: Request, filename: str):
     file_path = os.path.join(PROCESSED_DIR, filename)
@@ -271,7 +275,7 @@ async def download_file(request: Request, filename: str):
     return FileResponse(file_path, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename=filename)
 
 
-@app.get("/api/search/")
+@app.get("/api/search/",dependencies=[Depends(verify_api_key)])
 @limiter.limit("30/minute")
 async def search(
     request: Request,

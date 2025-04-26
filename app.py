@@ -97,16 +97,32 @@ def home():
 MAX_FILE_SIZE_MB = 10
 MAX_FILE_SIZE = 1024 * 1024 * MAX_FILE_SIZE_MB
 
+def write_matches_to_excel(matches_df, no_matches_df, output_path):
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        chunk_size = 1000
+        for i in range(0, len(matches_df), chunk_size):
+            chunk_df = matches_df.iloc[i:i + chunk_size]
+            chunk_df.to_excel(
+                writer,
+                sheet_name="Match Found",
+                index=False,
+                startrow=i,
+                header=(i == 0)
+            )
+        if not no_matches_df.empty:
+            no_matches_df.to_excel(writer, sheet_name="No Matches Found", index=False)
+
+
 @limiter.limit("5/minute")
 @app.post("/api/process-file/",dependencies=[Depends(verify_internal_request)])
-async def process_file(request: Request,file: UploadFile = File(...)):
+async def process_file(request: Request, file: UploadFile = File(...)):
     try:
         if not file:
+            logger.error("No file uploaded")
             raise HTTPException(status_code=400, detail="No file uploaded")
 
         logger.info(f"File received from {request.client.host}: {file.filename}")
 
-        # Ensure file is an Excel file
         if not file.filename.lower().endswith((".xlsx", ".csv")):
             raise HTTPException(status_code=415, detail="Invalid file type. Only .xlsx and .csv allowed")
 
@@ -116,104 +132,129 @@ async def process_file(request: Request,file: UploadFile = File(...)):
         file_stream = io.BytesIO(file_contents)
 
         try:
-            if file.filename.endswith(".xlsx"):    
-                # **Use Pandas but with robust error handling**
-                df = pd.read_excel(file_stream,engine="openpyxl",dtype=str,keep_default_na=False)
+            if file.filename.endswith(".xlsx"):
+                df = pd.read_excel(file_stream, engine="openpyxl", dtype=str, keep_default_na=False)
             else:
                 detected_encoding = chardet.detect(file_contents)['encoding'] or "ISO-8859-1"
-                # ✅ Use detected encoding or fallback to ISO-8859-1
                 file_stream.seek(0)
                 df = pd.read_csv(
                     file_stream,
                     dtype=str,
                     encoding=detected_encoding,
-                    delimiter=None,  # Auto-detect delimiter
-                    on_bad_lines="skip",  # Skip corrupt rows
+                    delimiter=None,
+                    on_bad_lines="skip",
                     skip_blank_lines=True,
                     quotechar='"',
                     low_memory=False,
                 )
         except Exception as e:
             logger.exception(f"File read error: {str(e)}")
-            raise HTTPException(status_code=422,detail="Failed to parse uploaded file")
-                # Ensure DataFrame is not empty
+            raise HTTPException(status_code=422, detail="Failed to parse uploaded file")
+
         if df.empty:
             logger.warning("Uploaded file is empty")
             raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
         logger.info(f"Columns in uploaded file: {df.columns.tolist()}")
 
-        phone_columns = ["phone", "Phone", "PHONE"]
-        email_columns = ["email", "Email", "EMAIL"]
-        match_column, search_field = None, None
+        phone_columns = ["phone", "Phone", "PHONE", "Contact", "Contact Number", "contact", "contact number"]
+        email_columns = ["email", "Email", "EMAIL", "Email Address", "email address"]
+        name_columns = ["name", "Name", "NAME", "Full Name", "full name"]
 
-        for col in df.columns:
-            if col.strip() in phone_columns:
-                match_column, search_field = col.strip(), "phone"
-                break
+        phone_column, email_column, name_column = None, None, None
 
-        if not match_column:
-            for col in df.columns:
-                if col.strip() in email_columns:
-                    match_column, search_field = col.strip(), "email"
-                    break
+        header_row = df.columns.tolist()
 
-        if not match_column:
-            logger.exception("No valid phone or email column found in file")
-            raise HTTPException(status_code=400, detail="No valid phone or email column found in file")
+        for col in header_row:
+            col = col.strip()
+            if col in phone_columns and not phone_column:
+                phone_column = col
+            if col in email_columns and not email_column:
+                email_column = col
+            if col in name_columns and not name_column:
+                name_column = col
 
-        # Convert values to string
-        values_to_search = list(set(df[match_column].astype(str)))
-        normalized_values = set()
+        if not phone_column and not email_column and not name_column:
+            logger.exception("No valid header found in file")
+            raise HTTPException(status_code=400, detail="No column found in file")
 
-        if search_field == "phone":
-            for val in values_to_search:
-                try:
-                    full_number, without_code = normalize_phone_number(val)
-                    normalized_values.add(int(full_number))
-                    normalized_values.add(int(without_code))
-                except Exception:
-                    continue
-        else:
-            normalized_values = set(values_to_search)
+        phone_values = [] 
+        email_values = []
+        name_values = []
 
-        # MongoDB query to match both string & integer formats
-        query = {
-            "$or": [
-                {search_field: {"$in": list(normalized_values)}},
-                {search_field: {"$in": values_to_search}},  
-            ]
-        }
+        if phone_column and phone_column in df.columns:
+            phone_values = list(set(df[phone_column].astype(str)))
+        if email_column and email_column in df.columns:
+            email_values = list(set(df[email_column].astype(str)))
+        if name_column and name_column in df.columns:
+            name_values = list(set(df[name_column].astype(str)))
 
-        logger.info(f"Extracted {len(values_to_search)} values from column: {match_column}")
+        # Normalize phone numbers
+        normalized_phone_values = set()
+        for val in phone_values:
+            try:
+                full_number, without_code = normalize_phone_number(val)
+                normalized_phone_values.add(int(full_number))
+                normalized_phone_values.add(int(without_code))
+            except Exception:
+                continue
+
+        # Prepare query
+        or_conditions = []
+        if normalized_phone_values:
+            or_conditions.append({"phone": {"$in": list(normalized_phone_values)}})
+            or_conditions.append({"phone": {"$in": phone_values}})
+        if email_values:
+            or_conditions.append({"email": {"$in": email_values}})
+        if name_values:
+            or_conditions.append({"name": {"$in": name_values}})
+
+        if not or_conditions:
+            logger.error("No phone or email or name values to search")
+            raise HTTPException(status_code=400, detail="No valid data to search")
+
+        query = {"$or": or_conditions}
+
+        # logger.info(f"Prepared MongoDB query: {query}")
 
         try:
-            # Fetch matching records from MongoDB
             matches = await collection.find(query, {"_id": 0}).to_list(None)
-            matches_df = pd.DataFrame(matches) if matches is not None else pd.DataFrame()
+            matches_df = pd.DataFrame(matches) if matches else pd.DataFrame()
         except Exception:
-            logger.exception(f"MongoDB query error")
+            logger.exception("MongoDB query error")
             raise HTTPException(status_code=500, detail="Database query failed")
-        
+
         if not matches_df.empty and "source" in matches_df.columns:
             matches_df.drop(columns=["source"], inplace=True)
 
-        found_values = set(matches_df[search_field].astype(str)) if not matches_df.empty else set()
+        # Find unmatched phones and emails
+        found_phone = set(matches_df["phone"].astype(str)) if phone_column and not matches_df.empty and "phone" in matches_df.columns else set()
+        found_email = set(matches_df["email"].astype(str)) if email_column and not matches_df.empty and "email" in matches_df.columns else set()
+        found_name = set(matches_df["name"].astype(str)) if name_column and not matches_df.empty and "name" in matches_df.columns else set()
 
-        # Identify non-matching values
-        not_found_values = [val for val in values_to_search if val not in found_values]
-        no_matches_df = pd.DataFrame({match_column: not_found_values})
+        unmatched_phone = [val for val in phone_values if val not in found_phone]
+        unmatched_email = [val for val in email_values if val not in found_email]
+        unmatched_name = [val for val in name_values if val not in found_name]
 
-        # Generate unique Excel filename
-        unique_filename = f"processed_{uuid.uuid4().hex}.xlsx"
-        output_file_path = os.path.join(PROCESSED_DIR, unique_filename)
+        # Build no_matches DataFrame
+        no_matches_data = {}
+        if unmatched_phone:
+            no_matches_data["Phone Not Found"] = unmatched_phone
+        if unmatched_email:
+            no_matches_data["Email Not Found"] = unmatched_email
+        if unmatched_name:
+            no_matches_data["Name Not Found"] = unmatched_name
+
+        no_matches_df = pd.DataFrame(dict([(k, pd.Series(v)) for k, v in no_matches_data.items()]))
+
+        # Generate output file name based on uploaded file name
+        original_filename = os.path.splitext(file.filename)[0]  # remove .xlsx or .csv extension
+        safe_filename = original_filename.replace(" ", "_").replace("/", "_")  # make filename safe
+        output_file_name = f"{safe_filename}_processed.xlsx"
+        output_file_path = os.path.join(PROCESSED_DIR, output_file_name)
 
         try:
-            with pd.ExcelWriter(output_file_path, engine="openpyxl") as writer:
-                if not matches_df.empty:
-                    matches_df.to_excel(writer, sheet_name="Match Found", index=False)
-                if not no_matches_df.empty:
-                    no_matches_df.to_excel(writer, sheet_name="No Matches Found", index=False)
+            write_matches_to_excel(matches_df,no_matches_df,output_file_path)
         except Exception:
             logger.exception("Error writing output file")
             raise HTTPException(status_code=500, detail="Failed to write output file")
@@ -224,12 +265,15 @@ async def process_file(request: Request,file: UploadFile = File(...)):
             "status": "success",
             "match_count": len(matches_df),
             "no_match_count": len(no_matches_df),
-            "download_url": f"/download-file/{os.path.basename(output_file_path)}"
+            "download_url": f"/download-file/{output_file_path}"
         })
 
+    except HTTPException as e:
+        raise e
     except Exception as e:
         logger.exception(f"Unexpected error: {str(e)}")
-        return JSONResponse(status_code=500,content={"status": 500, "error": "Internal Server Error"})
+        return JSONResponse(status_code=500, content={"status": 500, "error": "Internal Server Error"})
+
 
 @limiter.limit("10/minute")
 @app.get("/api/download-file/{filename}",dependencies=[Depends(verify_internal_request)])

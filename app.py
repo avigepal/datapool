@@ -3,15 +3,16 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.exceptions import RequestValidationError
 import pandas as pd
 from motor.motor_asyncio import AsyncIOMotorClient
-import os,uuid,html,logging,sys,io
-from typing import List,Any,Dict
+import os,html,logging,sys,io,chardet, re, zipfile, asyncio, multiprocessing
+from typing import List,Any,Dict,Optional
 from phone_utils import normalize_phone_number, clean_mongo_data
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from starlette.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-import chardet,re
 from pydantic import BaseModel
+from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor
 
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
@@ -97,23 +98,8 @@ def home():
 MAX_FILE_SIZE_MB = 10
 MAX_FILE_SIZE = 1024 * 1024 * MAX_FILE_SIZE_MB
 
-def write_matches_to_excel(matches_df, no_matches_df, output_path):
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        chunk_size = 1000
-        for i in range(0, len(matches_df), chunk_size):
-            chunk_df = matches_df.iloc[i:i + chunk_size]
-            chunk_df.to_excel(
-                writer,
-                sheet_name="Match Found",
-                index=False,
-                startrow=i,
-                header=(i == 0)
-            )
-        if not no_matches_df.empty:
-            no_matches_df.to_excel(writer, sheet_name="No Matches Found", index=False)
 
-
-@limiter.limit("5/minute")
+@limiter.limit("10/minute")
 @app.post("/api/process-file/",dependencies=[Depends(verify_internal_request)])
 async def process_file(request: Request, file: UploadFile = File(...)):
     try:
@@ -127,8 +113,10 @@ async def process_file(request: Request, file: UploadFile = File(...)):
             raise HTTPException(status_code=415, detail="Invalid file type. Only .xlsx and .csv allowed")
 
         file_contents = await file.read()
+        
         if len(file_contents) > MAX_FILE_SIZE:
             raise HTTPException(status_code=413, detail=f"File size exceeds {MAX_FILE_SIZE_MB}MB limit")
+        
         file_stream = io.BytesIO(file_contents)
 
         try:
@@ -157,45 +145,32 @@ async def process_file(request: Request, file: UploadFile = File(...)):
 
         logger.info(f"Columns in uploaded file: {df.columns.tolist()}")
 
-        phone_columns = ["phone", "Phone", "PHONE", "Contact", "Contact Number", "contact", "contact number"]
-        email_columns = ["email", "Email", "EMAIL", "Email Address", "email address"]
-        name_columns = ["name", "Name", "NAME", "Full Name", "full name"]
+        # Columns detection
+        header_mapping = {
+            "phone": ["phone", "Phone", "PHONE", "Contact", "Contact Number", "contact", "contact number"],
+            "email": ["email", "Email", "EMAIL", "Email Address", "email address"],
+            "name": ["name", "Name", "NAME", "Full Name", "full name"]
+        }
 
-        phone_column, email_column, name_column = None, None, None
+        phone_column = next((col for col in df.columns if col.strip() in header_mapping["phone"]), None)
+        email_column = next((col for col in df.columns if col.strip() in header_mapping["email"]), None)
+        name_column = next((col for col in df.columns if col.strip() in header_mapping["name"]), None)
 
-        header_row = df.columns.tolist()
-
-        for col in header_row:
-            col = col.strip()
-            if col in phone_columns and not phone_column:
-                phone_column = col
-            if col in email_columns and not email_column:
-                email_column = col
-            if col in name_columns and not name_column:
-                name_column = col
-
-        if not phone_column and not email_column and not name_column:
+        if not any([phone_column, email_column, name_column]):
             logger.exception("No valid header found in file")
-            raise HTTPException(status_code=400, detail="No column found in file")
+            raise HTTPException(status_code=400, detail="No valid header (phone, email, name) found in file.")
 
-        phone_values = [] 
-        email_values = []
-        name_values = []
-
-        if phone_column and phone_column in df.columns:
-            phone_values = list(set(df[phone_column].astype(str)))
-        if email_column and email_column in df.columns:
-            email_values = list(set(df[email_column].astype(str)))
-        if name_column and name_column in df.columns:
-            name_values = list(set(df[name_column].astype(str)))
+        # Extract values
+        phone_values = df[phone_column].dropna().astype(str).unique().tolist() if phone_column else []
+        email_values = df[email_column].dropna().astype(str).unique().tolist() if email_column else []
+        name_values = df[name_column].dropna().astype(str).unique().tolist() if name_column else []
 
         # Normalize phone numbers
         normalized_phone_values = set()
         for val in phone_values:
             try:
                 full_number, without_code = normalize_phone_number(val)
-                normalized_phone_values.add(int(full_number))
-                normalized_phone_values.add(int(without_code))
+                normalized_phone_values.update({str(full_number), str(without_code)})
             except Exception:
                 continue
 
@@ -204,14 +179,14 @@ async def process_file(request: Request, file: UploadFile = File(...)):
         if normalized_phone_values:
             or_conditions.append({"phone": {"$in": list(normalized_phone_values)}})
             or_conditions.append({"phone": {"$in": phone_values}})
-        if email_values:
+        elif email_values:
             or_conditions.append({"email": {"$in": email_values}})
-        if name_values:
+        elif name_values:
             or_conditions.append({"name": {"$in": name_values}})
 
         if not or_conditions:
             logger.error("No phone or email or name values to search")
-            raise HTTPException(status_code=400, detail="No valid data to search")
+            raise HTTPException(status_code=400, detail="No valid data (phone/email/name) to search.")
 
         query = {"$or": or_conditions}
 
@@ -227,34 +202,30 @@ async def process_file(request: Request, file: UploadFile = File(...)):
         if not matches_df.empty and "source" in matches_df.columns:
             matches_df.drop(columns=["source"], inplace=True)
 
-        # Find unmatched phones and emails
-        found_phone = set(matches_df["phone"].astype(str)) if phone_column and not matches_df.empty and "phone" in matches_df.columns else set()
-        found_email = set(matches_df["email"].astype(str)) if email_column and not matches_df.empty and "email" in matches_df.columns else set()
-        found_name = set(matches_df["name"].astype(str)) if name_column and not matches_df.empty and "name" in matches_df.columns else set()
+        # Find unmatched entries
+        found_phones = set(matches_df["phone"].astype(str)) if "phone" in matches_df.columns else set()
+        found_emails = set(matches_df["email"].astype(str)) if "email" in matches_df.columns else set()
+        found_names = set(matches_df["name"].astype(str)) if "name" in matches_df.columns else set()
 
-        unmatched_phone = [val for val in phone_values if val not in found_phone]
-        unmatched_email = [val for val in email_values if val not in found_email]
-        unmatched_name = [val for val in name_values if val not in found_name]
+        unmatched_data = {}
+        if phone_values:
+            unmatched_data["Phone Not Found"] = [val for val in phone_values if val not in found_phones]
+        if email_values:
+            unmatched_data["Email Not Found"] = [val for val in email_values if val not in found_emails]
+        if name_values:
+            unmatched_data["Name Not Found"] = [val for val in name_values if val not in found_names]
 
-        # Build no_matches DataFrame
-        no_matches_data = {}
-        if unmatched_phone:
-            no_matches_data["Phone Not Found"] = unmatched_phone
-        if unmatched_email:
-            no_matches_data["Email Not Found"] = unmatched_email
-        if unmatched_name:
-            no_matches_data["Name Not Found"] = unmatched_name
+        no_matches_df = pd.DataFrame(dict([(k, pd.Series(v)) for k, v in unmatched_data.items()]))
 
-        no_matches_df = pd.DataFrame(dict([(k, pd.Series(v)) for k, v in no_matches_data.items()]))
-
-        # Generate output file name based on uploaded file name
-        original_filename = os.path.splitext(file.filename)[0]  # remove .xlsx or .csv extension
-        safe_filename = original_filename.replace(" ", "_").replace("/", "_")  # make filename safe
-        output_file_name = f"{safe_filename}_processed.xlsx"
+        # Save processed output
+        base_filename = os.path.splitext(file.filename)[0].replace(" ", "_").replace("/", "_")
+        output_file_name = f"{base_filename}_processed.csv"
         output_file_path = os.path.join(PROCESSED_DIR, output_file_name)
 
         try:
-            write_matches_to_excel(matches_df,no_matches_df,output_file_path)
+            if not matches_df.empty:
+                matches_df = matches_df[matches_df["phone"].notna() & (matches_df["phone"] != '')]
+                matches_df.to_csv(output_file_path, matches_df)
         except Exception:
             logger.exception("Error writing output file")
             raise HTTPException(status_code=500, detail="Failed to write output file")
@@ -420,5 +391,168 @@ async def rapidapi_search(
             status_code=500,
             content={"status": 500, "error": "Internal Server Error"},
         )
+
+
+# Directories
+OUTPUT_DIR = os.getenv("OUTPUT_DIRECTORY")
+ZIP_DIR = os.getenv("ZIP_DIRECTORY")
+
+# Ensure directories exist
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(ZIP_DIR, exist_ok=True)
+
+executor = ProcessPoolExecutor()
+
+def process_file_in_process(filename: str, matches: List[dict]) -> Optional[str]:
+    try:
+        output_df = pd.DataFrame(matches)
+        
+        # Extract unmatched names
+        # matched_names = set(output_df["name"].tolist())
+        # unmatched_names = list(set(original_names) - matched_names)
+        # unmatched_df = pd.DataFrame(unmatched_names, columns=["name"])
+
+        if 'phone' not in output_df.columns:
+            return None
+
+        output_df = output_df[['name', 'phone']]
+        output_df = output_df[
+            output_df['phone'].notnull() &
+            output_df['phone'].astype(str).str.strip().ne('') &
+            output_df['phone'].astype(str).str.len().between(7, 15)
+        ]
+        output_df.drop_duplicates(subset='phone', inplace=True)
+
+        if output_df.empty:
+            return None
+
+        output_filename = f"{os.path.splitext(filename)[0]}_output.csv"
+        output_path = os.path.join(OUTPUT_DIR, output_filename)
+        output_df.to_csv(output_path, index=False)
+    
+        return output_path
+    except Exception as e:
+        return None
+
+async def process_full_file(file: UploadFile) -> Optional[str]:
+    try:
+        filename = file.filename
+        if not (filename.lower().endswith('.csv') or filename.lower().endswith('.xlsx')):
+            logger.warning(f"Invalid file type {filename} - Skipping.")
+            return None
+
+        contents = await file.read()
+
+        try:
+            if filename.lower().endswith('.csv'):
+                df = pd.read_csv(io.BytesIO(contents))
+            else:
+                df = pd.read_excel(io.BytesIO(contents), engine="openpyxl")
+        except Exception as e:
+            logger.warning(f"Failed to read file {filename}: {e}")
+            return None
+
+        if df.empty:
+            logger.warning(f"{filename} is empty. Skipping.")
+            return None
+
+        df.columns = [col.lower().strip() for col in df.columns]
+        if 'name' not in df.columns:
+            logger.warning(f"'name' column missing in {filename}")
+            return None
+
+        names = df['name'].dropna().tolist()
+        if not names:
+            logger.warning(f"No valid names found in {filename}")
+            return None
+
+        results_cursor = collection.find(
+            {"name": {"$in": names}},
+            {"name": 1, "phone": 1, "_id": 0}
+        )
+        results = await results_cursor.to_list(length=None)
+
+        if not results:
+            logger.info(f"No matches found in DB for {filename}.")
+            return None
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(executor, process_file_in_process, filename, results)
+
+    except Exception as e:
+        logger.error(f"Error processing file {file.filename}: {e}", exc_info=True)
+        return None
+    
+async def limited_gather(tasks, limit):
+    semaphore = asyncio.Semaphore(limit)
+
+    async def sem_task(task):
+        async with semaphore:
+            return await task
+
+    return await asyncio.gather(*(sem_task(t) for t in tasks))
+
+
+@app.post("/api/upload-files/", dependencies=[Depends(verify_internal_request)])
+@limiter.limit("10/minute")
+async def upload_files(request: Request, files: List[UploadFile] = File(...)):
+    if not files:
+        logger.warning("No files provided!")
+        return JSONResponse({"error": "No files provided"}, status_code=400)
+
+    logger.info(f"[INTERNAL] Received {len(files)} files from {request.client.host}")
+
+    try:
+        tasks = [process_full_file(file) for file in files]
+        dynamic_limit = min(max(2, multiprocessing.cpu_count() // 2), 10)
+        logger.info(f"Dynamic concurrency limit: {dynamic_limit}")
+        completed_paths = await limited_gather(tasks, limit=dynamic_limit)
+        output_files = [path for path in completed_paths if path]
+
+        if not output_files:
+            logger.warning("All files skipped or produced empty results.")
+            return JSONResponse({"error": "No valid matches found."}, status_code=400)
+
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        zip_filename = f"results_{timestamp}.zip"
+        zip_path = os.path.join(ZIP_DIR, zip_filename)
+
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zipf:
+            for file_path in output_files:
+                zipf.write(file_path, arcname=os.path.basename(file_path))
+                os.remove(file_path)
+
+        base_url = str(request.base_url).rstrip("/")
+        download_link = f"{base_url}/api/download/{zip_filename}"
+
+        logger.info(f"ZIP created successfully: {zip_filename} with {len(output_files)} output files")
+
+        return {"download_link": download_link}
+
+    except Exception as e:
+        import traceback
+        logger.error(f"Fatal server error: {traceback.format_exc()}")
+        return JSONResponse({"error": "Server error", "details": str(e)}, status_code=500)
+
+
+@app.get("/api/download/{filename}", dependencies=[Depends(verify_internal_request)])
+async def download(filename: str):
+    file_path = os.path.join(ZIP_DIR, filename)
+    if not os.path.exists(file_path):
+        return JSONResponse({"error": "File not found"}, status_code=404)
+    return FileResponse(
+        file_path,
+        filename=filename,
+        media_type="application/zip"
+    )
+
+@app.delete("/api/delete/{filename}", dependencies=[Depends(verify_internal_request)])
+async def delete_file(filename: str):
+    file_path = os.path.join(ZIP_DIR, filename)
+    if os.path.exists(file_path):
+        os.remove(file_path)
+        logger.info(f"Deleted file: {file_path}")
+        return {"success": True}
+    return JSONResponse({"error": "File not found"}, status_code=404)
 
 logger.info("FastAPI application started")

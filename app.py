@@ -3,7 +3,7 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.exceptions import RequestValidationError
 import pandas as pd
 from motor.motor_asyncio import AsyncIOMotorClient
-import os,html,logging,sys,io,chardet, re, zipfile, asyncio, multiprocessing
+import os,html,logging,sys,io,chardet, re, zipfile, asyncio, multiprocessing, csv
 from typing import List,Any,Dict,Optional
 from phone_utils import normalize_phone_number, clean_mongo_data
 from slowapi import Limiter
@@ -392,7 +392,6 @@ async def rapidapi_search(
             content={"status": 500, "error": "Internal Server Error"},
         )
 
-
 # Directories
 OUTPUT_DIR = os.getenv("OUTPUT_DIRECTORY")
 ZIP_DIR = os.getenv("ZIP_DIRECTORY")
@@ -407,11 +406,6 @@ def process_file_in_process(filename: str, matches: List[dict]) -> Optional[str]
     try:
         output_df = pd.DataFrame(matches)
         
-        # Extract unmatched names
-        # matched_names = set(output_df["name"].tolist())
-        # unmatched_names = list(set(original_names) - matched_names)
-        # unmatched_df = pd.DataFrame(unmatched_names, columns=["name"])
-
         if 'phone' not in output_df.columns:
             return None
 
@@ -434,7 +428,10 @@ def process_file_in_process(filename: str, matches: List[dict]) -> Optional[str]
     except Exception as e:
         return None
 
-async def process_full_file(file: UploadFile) -> Optional[str]:
+def normalize_name(name: str) -> str:
+    return re.sub(r'\s+', ' ', name.strip().lower())
+
+async def process_full_file(file: UploadFile,unmatched_names_global: set, all_names_global: set, matched_names_global: set) -> Optional[str]:
     try:
         filename = file.filename
         if not (filename.lower().endswith('.csv') or filename.lower().endswith('.xlsx')):
@@ -457,25 +454,37 @@ async def process_full_file(file: UploadFile) -> Optional[str]:
             return None
 
         df.columns = [col.lower().strip() for col in df.columns]
+        
         if 'name' not in df.columns:
             logger.warning(f"'name' column missing in {filename}")
             return None
 
-        names = df['name'].dropna().tolist()
-        if not names:
+        # names = [name.strip().lower() for name in df['name'].dropna()]
+        names = [normalize_name(name) for name in df['name'].dropna()]
+        unique_names = set(names)
+        all_names_global.update(unique_names)
+        
+        if not unique_names:
             logger.warning(f"No valid names found in {filename}")
             return None
 
         results_cursor = collection.find(
-            {"name": {"$in": names}},
+            {"name": {"$in": list(unique_names)}},
             {"name": 1, "phone": 1, "_id": 0}
         )
         results = await results_cursor.to_list(length=None)
-
+        
         if not results:
             logger.info(f"No matches found in DB for {filename}.")
+            unmatched_names_global.update(unique_names)
             return None
-
+        
+        matched_names = set(normalize_name(entry['name']) for entry in results if 'name' in entry)
+        matched_names_global.update(matched_names)# added
+        
+        unmatched_names = unique_names - matched_names
+        unmatched_names_global.update(unmatched_names) # added
+        
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(executor, process_file_in_process, filename, results)
 
@@ -485,11 +494,9 @@ async def process_full_file(file: UploadFile) -> Optional[str]:
     
 async def limited_gather(tasks, limit):
     semaphore = asyncio.Semaphore(limit)
-
     async def sem_task(task):
         async with semaphore:
             return await task
-
     return await asyncio.gather(*(sem_task(t) for t in tasks))
 
 
@@ -499,22 +506,42 @@ async def upload_files(request: Request, files: List[UploadFile] = File(...)):
     if not files:
         logger.warning("No files provided!")
         return JSONResponse({"error": "No files provided"}, status_code=400)
-
     logger.info(f"[INTERNAL] Received {len(files)} files from {request.client.host}")
 
     try:
-        tasks = [process_full_file(file) for file in files]
+        unmatched_names_global = set()
+        matched_names_global = set()
+        all_names_global = set()
+        
+        tasks = [process_full_file(file, unmatched_names_global, all_names_global,matched_names_global) for file in files]
         dynamic_limit = min(max(2, multiprocessing.cpu_count() // 2), 10)
-        logger.info(f"Dynamic concurrency limit: {dynamic_limit}")
         completed_paths = await limited_gather(tasks, limit=dynamic_limit)
         output_files = [path for path in completed_paths if path]
+        
+        unmatched_csv_path = None
+        if unmatched_names_global:
+            unmatched_filename = f"unmatched_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
+            unmatched_csv_path = os.path.join(OUTPUT_DIR, unmatched_filename)
+
+            with open(unmatched_csv_path, mode='w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(["unmatched_name"])
+                for name in unmatched_names_global:
+                    writer.writerow([name])
+                writer.writerow([])  # blank line before summary
+                writer.writerow(["SUMMARY"])
+                writer.writerow(["Total Unique Names", len(all_names_global)])
+                writer.writerow(["Matched Names", len(matched_names_global)])
+                writer.writerow(["Unmatched Names", len(unmatched_names_global)])
+
+            output_files.append(unmatched_csv_path)
 
         if not output_files:
             logger.warning("All files skipped or produced empty results.")
             return JSONResponse({"error": "No valid matches found."}, status_code=400)
 
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        zip_filename = f"results_{timestamp}.zip"
+        zip_filename = f"output_{timestamp}.zip"
         zip_path = os.path.join(ZIP_DIR, zip_filename)
 
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zipf:
@@ -526,8 +553,14 @@ async def upload_files(request: Request, files: List[UploadFile] = File(...)):
         download_link = f"{base_url}/api/download/{zip_filename}"
 
         logger.info(f"ZIP created successfully: {zip_filename} with {len(output_files)} output files")
+        
+        summary = {
+            "total_names": len(all_names_global),
+            "matched_names": len(matched_names_global),
+            "unmatched_count": len(unmatched_names_global)
+        }
 
-        return {"download_link": download_link}
+        return {"download_link": download_link, "summary": summary}
 
     except Exception as e:
         import traceback
@@ -546,13 +579,13 @@ async def download(filename: str):
         media_type="application/zip"
     )
 
-@app.delete("/api/delete/{filename}", dependencies=[Depends(verify_internal_request)])
-async def delete_file(filename: str):
-    file_path = os.path.join(ZIP_DIR, filename)
-    if os.path.exists(file_path):
-        os.remove(file_path)
-        logger.info(f"Deleted file: {file_path}")
-        return {"success": True}
-    return JSONResponse({"error": "File not found"}, status_code=404)
+# @app.delete("/api/delete/{filename}", dependencies=[Depends(verify_internal_request)])
+# async def delete_file(filename: str):
+#     file_path = os.path.join(ZIP_DIR, filename)
+#     if os.path.exists(file_path):
+#         os.remove(file_path)
+#         logger.info(f"Deleted file: {file_path}")
+#         return {"success": True}
+#     return JSONResponse({"error": "File not found"}, status_code=404)
 
 logger.info("FastAPI application started")

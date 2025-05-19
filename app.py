@@ -271,6 +271,7 @@ async def search(
     phone: str = Query(None, min_length=7, max_length=15, description="Search by phone number, e.g. +1234567890"),
     email: str = Query(None, regex=r"^[\w\.-]+@[\w\.-]+\.\w{2,}$", description="Search by email"),
     name: str = Query(None, min_length=2, max_length=100, description="Search by name"),
+    username: str = Query(None, min_length=3, max_length=100,description="Search by username"),
     page: int = Query(1, ge=1, description="Page number (must be 1 or greater)"),
     per_page: int = Query(10, ge=1, le=100, description="Number of results per page (1-100)"),
 ):
@@ -283,9 +284,9 @@ async def search(
             )
 
     query_conditions = {}
-    if not phone and not email and not name:
-        logger.error("At least one search parameter (phone, email, or name) is required")
-        return JSONResponse({"status": 400, "error": "At least one search parameter (phone, email, or name) is required"})
+    if not phone and not email and not name and not username:
+        logger.error("At least one search parameter (phone, email, username or name) is required")
+        return JSONResponse({"status": 400, "error": "At least one search parameter (phone, email, username or name) is required"})
     
     if phone:
         phone = html.escape(phone)  # Sanitize input
@@ -305,6 +306,10 @@ async def search(
     if name:
         name = html.escape(name)  # Sanitize input
         query_conditions["name"] = {"$eq": name}  # Exact match for name
+
+    if username:
+        username = html.escape(username)
+        query_conditions["username"] = {"$eq": username}
     
     logger.info(f"Search query: {query_conditions}")
     

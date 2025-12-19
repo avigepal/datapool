@@ -381,7 +381,7 @@ async def rapidapi_search(
 
     try:
         # No pagination — get all results
-        projection = {"_id": 0, "source": 0}  # Hide source
+        projection = {"_id": 0, "name": 1}
         results = await collection.find(mongo_query, projection).to_list(length=None)
 
         cleaned_results = [clean_mongo_data(doc) for doc in results]

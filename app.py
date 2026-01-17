@@ -420,9 +420,17 @@ def normalize_service(service: str) -> str:
 
 async def h_search(request: EmailRequest):
     email = request.email.strip()
+    
+    venv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "venv")
+    holehe_path = os.path.join(venv_path, ".venv", "bin", "holehe")
+    
+    if not os.path.exists(holehe_path):
+        logger.error("Holehe executable not found.")
+        holehe_path = "holehe"  # Assume it's in PATH
+
     try:
         proc = await asyncio.create_subprocess_exec(
-            "holehe",
+            holehe_path,
             email,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
